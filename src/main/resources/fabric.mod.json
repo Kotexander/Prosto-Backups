@@ -1,0 +1,45 @@
+{
+	"schemaVersion": 1,
+	"id": "prostobackups",
+	"version": "${version}",
+	"name": "Prosto Backups",
+	"description": "Simple mod to create backups",
+	"authors": [
+		"Alexander Koterev"
+	],
+	"contact": {
+		"homepage": "https://fabricmc.net/",
+		"sources": "https://github.com/FabricMC/fabric-example-mod"
+	},
+	"license": "CC0-1.0",
+	"icon": "assets/prostobackups/icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			{
+				"value": "kotexander.prostobackups.ProstoBackups",
+				"adapter": "kotlin"
+			}
+		],
+		"client": [
+			{
+				"value": "kotexander.prostobackups.client.ProstoBackupsClient",
+				"adapter": "kotlin"
+			}
+		]
+	},
+	"mixins": [
+		"prostobackups.mixins.json",
+		{
+			"config": "prostobackups.client.mixins.json",
+			"environment": "client"
+		}
+	],
+	"depends": {
+		"fabricloader": ">=0.19.3",
+		"minecraft": "~26.2",
+		"java": ">=25",
+		"fabric-api": "*",
+		"fabric-language-kotlin": "*"
+	}
+}
