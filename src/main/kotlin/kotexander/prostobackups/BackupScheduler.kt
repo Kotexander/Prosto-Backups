@@ -1,68 +1,95 @@
 package kotexander.prostobackups
 
-import java.util.concurrent.atomic.AtomicLong
-import kotlin.time.Duration
-import kotlinx.coroutines.*
-import kotlinx.datetime.*
-import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents
+import com.cronutils.model.CronType
+import com.cronutils.model.definition.CronDefinitionBuilder
+import com.cronutils.model.time.ExecutionTime
+import com.cronutils.parser.CronParser
 import net.minecraft.server.MinecraftServer
-import kotlin.time.Clock
+import java.lang.Thread.sleep
+import java.time.ZonedDateTime
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
+import kotlin.concurrent.atomics.AtomicLong
+import kotlin.concurrent.atomics.ExperimentalAtomicApi
+import kotlin.concurrent.atomics.incrementAndFetch
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.hours
+import kotlin.time.Duration.Companion.minutes
+import kotlin.time.Duration.Companion.seconds
 
+@OptIn(ExperimentalAtomicApi::class)
 object BackupScheduler {
-    private var scope: CoroutineScope? = null
-
     // Use AtomicLong since this is modified on the server thread but read/reset on a Coroutine worker thread
     private val ticksPlayedToday = AtomicLong(0)
 
-    init {
-        ServerTickEvents.END_SERVER_TICK.register { tickServer ->
-            if (tickServer.playerList.playerCount > 0) {
-                ticksPlayedToday.incrementAndGet()
-            }
-        }
-    }
+    private val cronDefinition = CronDefinitionBuilder.instanceDefinitionFor(CronType.UNIX)
+    private val parser = CronParser(cronDefinition)
+    private val cron = parser.parse("0 3 * * *")
+    private val executionTime = ExecutionTime.forCron(cron)
+
+    private var executor: ScheduledExecutorService? = null
 
     fun start(server: MinecraftServer) {
         stop()
 
-        scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
-        scope?.launch {
-            while (isActive) {
-                val delayDuration = getDurationUntilTargetTime(targetHour = 3, targetMinute = 0)
-                delay(delayDuration)
-
-                val minutesPlayed = ticksPlayedToday.get() / 1200
-
-                if (minutesPlayed > 10) {
-                    ticksPlayedToday.set(0)
-                    BackupManager.startBackup(server.createCommandSourceStack())
-                }
-            }
-        }
+        executor = Executors.newSingleThreadScheduledExecutor()
+        scheduleNext(server)
     }
 
     fun stop() {
-        scope?.cancel() // Gracefully cancels all coroutines
-        scope = null
-        ticksPlayedToday.set(0)
+        executor?.shutdownNow()
+        executor = null
+
+        ticksPlayedToday.store(0)
     }
 
-    private fun getDurationUntilTargetTime(targetHour: Int, targetMinute: Int): Duration {
-        val tz = TimeZone.currentSystemDefault()
-        val now = Clock.System.now()
-        val localNow = now.toLocalDateTime(tz)
-
-        val targetTime = LocalTime(targetHour, targetMinute)
-
-        // Determine the target date based on whether the time has already passed today
-        val targetDate = if (localNow.time >= targetTime) {
-            localNow.date.plus(DatePeriod(days = 1))
-        } else {
-            localNow.date
+    fun tick(server: MinecraftServer) {
+        if (server.playerCount > 0) {
+            ticksPlayedToday.incrementAndFetch()
         }
+    }
 
-        val targetInstant = targetDate.atTime(targetTime).toInstant(tz)
+    private fun scheduleNext(server: MinecraftServer) {
+        val currentExecutor = executor ?: return
+        if (currentExecutor.isShutdown) return
 
-        return targetInstant - now
+        val delay = getUntilNextRun()
+
+        currentExecutor.schedule(
+            {
+                try {
+                    if (getTimePlayedToday() > 10.minutes) {
+                        ticksPlayedToday.store(0)
+                        server.execute {
+                            BackupManager.start(server.createCommandSourceStack())
+                        }
+                    }
+                } catch (e: Exception) {
+                    ProstoBackups.LOGGER.error("Error occurred during scheduled backup evaluation", e)
+                } finally {
+                    sleep(100) // there was an issue where 2 backups started for one cron job
+                    scheduleNext(server)
+                }
+            },
+            delay.inWholeMilliseconds, TimeUnit.MILLISECONDS,
+        )
+    }
+
+    fun getTimePlayedToday(): Duration {
+        return (ticksPlayedToday.load() / 20).seconds
+    }
+
+    fun getUntilNextRun(): Duration {
+        val now = ZonedDateTime.now()
+        val next = executionTime.nextExecution(now)
+
+        return if (next.isPresent) {
+            // round to nearest second
+           java.time.Duration.between(now, next.get()).seconds.seconds
+        } else {
+            ProstoBackups.LOGGER.error("Cron calculation failed! Defaulting to 2 hours.")
+            2.hours
+        }
     }
 }
