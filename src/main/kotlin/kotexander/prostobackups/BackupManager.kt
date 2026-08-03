@@ -8,102 +8,70 @@ import java.time.format.DateTimeFormatter
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import java.util.zip.Deflater
-import kotlin.concurrent.atomics.AtomicBoolean
-import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import java.nio.file.Path
-import kotlin.concurrent.thread
+import java.util.concurrent.CompletableFuture
 import kotlin.io.path.*
 
-@OptIn(ExperimentalAtomicApi::class)
 object BackupManager {
-    private val isBackupRunning = AtomicBoolean(false)
-    private val shouldStop = AtomicBoolean(false)
+    @Volatile
+    private var isRunning = false
 
+    // This must be called on the server thread
     fun start(source: CommandSourceStack) {
         val server = source.server
 
-        if (!isBackupRunning.compareAndSet(false, true)) {
+        if (isRunning) {
             source.sendFailure(Component.literal("A backup is already in progress!"))
             return
         }
-
         source.sendSuccess({ Component.literal("Starting backup...") }, true)
-        server.isAutoSave = false
 
         // Save world
-        val saveSuccess = server.saveEverything(false, true, true)
-        if (!saveSuccess) {
-            source.sendFailure(Component.literal("Failed to save the world before backup."))
-            server.isAutoSave = true
-            isBackupRunning.store(false)
-            return
-        }
+        val previousAutoSave = server.isAutoSave
+        server.isAutoSave = false
+        server.saveEverything(true, true, true)
+        isRunning = true
 
-        // Get world folder
         val worldDir = server.getWorldPath(LevelResource.ROOT)
+        CompletableFuture.runAsync {
+            val zipPath = newBackupName()
+            createZipBackup(worldDir, zipPath)
+        }.handleAsync({ _, exception ->
+            server.isAutoSave = previousAutoSave
+            isRunning = false
 
-        // Name backup file
-        val timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd"))
-        val backupsFolder = Path("backups")
-        val zipFile = backupsFolder / "world-$timestamp.zip"
-        backupsFolder.createDirectories()
-
-        thread(name = "Backup thread") {
-            try {
-                val ret = createZipBackup(worldDir, zipFile)
-                if (!ret) {
-                    ProstoBackups.LOGGER.warn("Backup was interrupted.")
-                }
-                server.execute {
-                    if (ret) {
-                        source.sendSuccess({ Component.literal("Backup completed!") }, true)
-                    } else {
-                        source.sendFailure(Component.literal("Backup was interrupted."))
-                    }
-                }
-            } catch (e: Exception) {
-                server.execute {
-                    source.sendFailure(Component.literal("Backup failed: ${e.message}"))
-                }
-            } finally {
-                server.execute {
-                    server.isAutoSave = true
-                    shouldStop.store(false)
-                    isBackupRunning.store(false)
-                }
+            if (exception != null) {
+                val msg = exception.cause?.message ?: exception.message ?: "Unknown error"
+                ProstoBackups.LOGGER.error("Backup failed", exception)
+                source.sendFailure(Component.literal("Backup failed: $msg"))
+            } else {
+                source.sendSuccess({ Component.literal("Backup completed!") }, true)
             }
-        }
+        }, server::execute)
     }
 
-    private fun createZipBackup(sourceDir: Path, destPath: Path): Boolean {
-        var isCancelled = false
+    // This must be called on the server thread
+    fun isRunning(): Boolean = isRunning
+
+    private fun newBackupName(): Path {
+        val timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd"))
+        val backupsFolder = Path("backups")
+        backupsFolder.createDirectories()
+        val zipPath = backupsFolder / "world-$timestamp.zip"
+
+        return zipPath
+    }
+
+    private fun createZipBackup(sourceDir: Path, destPath: Path) {
         try {
-            val buffer = ByteArray(8192)
-            ZipOutputStream(destPath.outputStream()).use { zos ->
+            ZipOutputStream(destPath.outputStream().buffered()).use { zos ->
                 zos.setLevel(Deflater.BEST_COMPRESSION)
-                val files = sourceDir.walk()
-                    .filter { it.isRegularFile() }
-                    .filter { it.name != "session.lock" }
-                    .filter { !it.startsWith(destPath) }
 
+                val files = sourceDir.walk().filter { it.isRegularFile() }.filter { it.name != "session.lock" }
                 for (file in files) {
-                    // Gets the relative path and automatically standardizes slashes
                     val relativePath = (Path("world") / file.relativeTo(sourceDir)).invariantSeparatorsPathString
-
                     zos.putNextEntry(ZipEntry(relativePath))
-                    file.inputStream().use { input ->
-                        while (true) {
-                            // check if we should stop and cleanup
-                            if (shouldStop.load()) {
-                                isCancelled = true
-                                return@use
-                            }
-
-                            val read = input.read(buffer)
-                            if (read == -1) break
-                            zos.write(buffer, 0, read)
-                        }
-                    }
+                    file.inputStream().use { it.copyTo(zos) }
                     zos.closeEntry()
                 }
             }
@@ -111,17 +79,6 @@ object BackupManager {
             destPath.deleteIfExists()
             throw e
         }
-
-        if (isCancelled || shouldStop.load()) {
-            destPath.deleteIfExists()
-            return false
-        }
-
-        return true
-    }
-
-    fun cancel() {
-        shouldStop.store(true)
     }
 }
 

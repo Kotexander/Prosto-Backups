@@ -39,7 +39,6 @@ object ProstoBackups : ModInitializer {
             )
         }
 
-
         ServerTickEvents.END_SERVER_TICK.register { server ->
             BackupScheduler.tick(server)
         }
@@ -50,7 +49,6 @@ object ProstoBackups : ModInitializer {
 
         ServerLifecycleEvents.SERVER_STOPPING.register {
             BackupScheduler.stop()
-            BackupManager.cancel()
         }
     }
 }
